@@ -1,13 +1,23 @@
 import SwiftUI
 import UIKit
 
+private enum GamePhase: Equatable {
+    case setup
+    case preview
+    case playing
+    case completed
+}
+
+private struct CardGridMetrics {
+    let columns: [GridItem]
+    let cardWidth: CGFloat
+    let cardHeight: CGFloat
+    let spacing: CGFloat
+}
+
 struct ContentView: View {
     private static let pairCountOptions = [2, 4, 6, 8]
     private static let defaultNumberOfPairs = 4
-    private static let statColumns = [
-        GridItem(.flexible(), spacing: 12),
-        GridItem(.flexible(), spacing: 12)
-    ]
 
     @AppStorage("bestMoves2") private var bestMoves2 = 0
     @AppStorage("bestMoves4") private var bestMoves4 = 0
@@ -17,14 +27,18 @@ struct ContentView: View {
     @State private var firstSelectedCardID: UUID?
     @State private var isResolvingTurn = false
     @State private var resolutionTask: Task<Void, Never>?
+    @State private var previewTask: Task<Void, Never>?
+    @State private var timerTask: Task<Void, Never>?
+    @State private var gameID = UUID()
+    @State private var phase = GamePhase.setup
     @State private var moves = 0
     @State private var numberOfPairs = Self.defaultNumberOfPairs
     @State private var selectedTheme = GameTheme.fruit
     @State private var elapsedSeconds = 0
-    @State private var timerTask: Task<Void, Never>?
     @State private var hasGameStarted = false
     @State private var achievedNewBest = false
     @State private var isShowingNewGameConfirmation = false
+    @State private var isShowingSetupConfirmation = false
 
     init() {
         _cards = State(
@@ -35,17 +49,31 @@ struct ContentView: View {
         )
     }
 
-    private var columns: [GridItem] {
-        let columnCount = switch numberOfPairs {
+    private var columnCount: Int {
+        switch numberOfPairs {
         case 2: 2
         case 6: 3
         default: 4
         }
+    }
 
-        return Array(
+    private var setupColumns: [GridItem] {
+        Array(
             repeating: GridItem(.flexible(), spacing: 10),
             count: columnCount
         )
+    }
+
+    private var cardAspectRatio: CGFloat {
+        numberOfPairs >= 6 ? 0.90 : 0.86
+    }
+
+    private var cardSymbolSize: CGFloat {
+        switch numberOfPairs {
+        case 2: 52
+        case 6: 40
+        default: 35
+        }
     }
 
     private var matchedPairs: Int {
@@ -80,50 +108,45 @@ struct ContentView: View {
         moves > 0 || firstSelectedCardID != nil || matchedPairs > 0 || hasGameStarted
     }
 
-    private var cardSymbolSize: CGFloat {
-        switch numberOfPairs {
-        case 2: 54
-        case 6: 42
-        default: 36
-        }
-    }
-
     var body: some View {
-        ZStack {
-            ThemeBackground(theme: selectedTheme)
+        GeometryReader { screen in
+            ZStack {
+                ThemeBackground(theme: selectedTheme)
 
-            ScrollView {
-                VStack(spacing: 18) {
-                    headerView
-                    controlsView
-                    statsView
-                    boardView
+                ScrollViewReader { scrollProxy in
+                    ScrollView {
+                        Color.clear
+                            .frame(height: 0)
+                            .id("screenTop")
 
-                    if gameIsComplete {
-                        completionView
-                            .transition(.scale(scale: 0.88).combined(with: .opacity))
+                        if phase == .setup {
+                            setupContent
+                                .transition(.move(edge: .top).combined(with: .opacity))
+                        } else {
+                            activeGameContent(screenSize: screen.size)
+                                .transition(.opacity)
+                        }
                     }
-
-                    resetButton
+                    .scrollIndicators(.hidden)
+                    .scrollDisabled(phase == .preview)
+                    .id(phase == .setup)
+                    .onChange(of: phase) {
+                        scrollProxy.scrollTo("screenTop", anchor: .top)
+                    }
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 18)
-                .padding(.bottom, 32)
-                .animation(.spring(response: 0.48, dampingFraction: 0.78), value: gameIsComplete)
             }
-            .scrollIndicators(.hidden)
         }
         .preferredColorScheme(.light)
+        .animation(.easeInOut(duration: 0.24), value: phase == .setup)
         .onDisappear {
-            resolutionTask?.cancel()
-            timerTask?.cancel()
+            cancelAsyncTasks()
         }
         .confirmationDialog(
             "Start a new game?",
             isPresented: $isShowingNewGameConfirmation,
             titleVisibility: .visible
         ) {
-            Button("New Game", role: .destructive) {
+            Button("Reset Game", role: .destructive) {
                 HapticFeedback.newGame()
                 startNewGame()
             }
@@ -132,21 +155,37 @@ struct ContentView: View {
         } message: {
             Text("Your current progress will be lost.")
         }
+        .confirmationDialog(
+            "Change setup?",
+            isPresented: $isShowingSetupConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Change Setup", role: .destructive) {
+                enterSetupMode()
+            }
+
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Your current progress will be lost.")
+        }
     }
 
-    private var headerView: some View {
+    private var setupContent: some View {
+        VStack(spacing: 18) {
+            setupHeader
+            setupBestScore
+            setupControls
+            startGameButton
+            setupBoard
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 18)
+        .padding(.bottom, 32)
+    }
+
+    private var setupHeader: some View {
         VStack(spacing: 5) {
-            Text(selectedTheme.displayTitle)
-                .font(.system(size: 42, weight: .heavy, design: .rounded))
-                .foregroundStyle(
-                    LinearGradient(
-                        colors: [selectedTheme.secondaryColor, selectedTheme.primaryColor],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-                .lineLimit(1)
-                .minimumScaleFactor(0.72)
+            themedTitle(size: 42)
 
             Text(selectedTheme.subtitle)
                 .font(.system(.subheadline, design: .rounded, weight: .medium))
@@ -156,7 +195,42 @@ struct ContentView: View {
         .accessibilityElement(children: .combine)
     }
 
-    private var controlsView: some View {
+    private var setupBestScore: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "trophy.fill")
+                .font(.system(size: 18, weight: .bold))
+                .foregroundStyle(selectedTheme.accentColor)
+                .frame(width: 38, height: 38)
+                .background(selectedTheme.accentColor.opacity(0.15), in: Circle())
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("BEST FOR \(numberOfPairs) PAIRS")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.secondary)
+
+                Text(currentBestMoves == 0 ? "No score yet" : "\(currentBestMoves) moves")
+                    .font(.system(.headline, design: .rounded, weight: .bold))
+                    .foregroundStyle(Color(red: 0.25, green: 0.22, blue: 0.18))
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .frame(maxWidth: .infinity, minHeight: 66)
+        .background(.white.opacity(0.76), in: RoundedRectangle(cornerRadius: 19))
+        .overlay {
+            RoundedRectangle(cornerRadius: 19)
+                .stroke(selectedTheme.accentColor.opacity(0.22), lineWidth: 1)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            currentBestMoves == 0
+                ? "No best score yet"
+                : "Best score \(currentBestMoves) moves"
+        )
+    }
+
+    private var setupControls: some View {
         HStack(spacing: 12) {
             Menu {
                 Picker("Game Size", selection: $numberOfPairs) {
@@ -175,7 +249,7 @@ struct ContentView: View {
             }
             .accessibilityLabel("Game size, \(numberOfPairs) pairs")
             .onChange(of: numberOfPairs) {
-                startNewGame()
+                prepareBoard(for: .setup)
             }
             .frame(maxWidth: .infinity)
 
@@ -196,7 +270,7 @@ struct ContentView: View {
             }
             .accessibilityLabel("Card theme, \(selectedTheme.displayName)")
             .onChange(of: selectedTheme) {
-                startNewGame()
+                prepareBoard(for: .setup)
             }
             .frame(maxWidth: .infinity)
         }
@@ -208,11 +282,11 @@ struct ContentView: View {
         value: String,
         color: Color
     ) -> some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 9) {
             Image(systemName: icon)
-                .font(.system(size: 17, weight: .bold))
+                .font(.system(size: 16, weight: .bold))
                 .foregroundStyle(color)
-                .frame(width: 30, height: 30)
+                .frame(width: 29, height: 29)
                 .background(color.opacity(0.13), in: Circle())
 
             VStack(alignment: .leading, spacing: 1) {
@@ -226,14 +300,14 @@ struct ContentView: View {
                     .lineLimit(1)
             }
 
-            Spacer(minLength: 2)
+            Spacer(minLength: 1)
 
             Image(systemName: "chevron.down")
                 .font(.caption2.bold())
                 .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 12)
-        .frame(maxWidth: .infinity, minHeight: 54)
+        .padding(.horizontal, 11)
+        .frame(maxWidth: .infinity, minHeight: 52)
         .background(.white.opacity(0.82), in: RoundedRectangle(cornerRadius: 17))
         .overlay {
             RoundedRectangle(cornerRadius: 17)
@@ -242,180 +316,12 @@ struct ContentView: View {
         .shadow(color: color.opacity(0.10), radius: 8, y: 4)
     }
 
-    private var statsView: some View {
-        LazyVGrid(columns: Self.statColumns, spacing: 12) {
-            statCard(
-                title: "Moves",
-                value: "\(moves)",
-                icon: "hand.tap.fill",
-                color: selectedTheme.secondaryColor,
-                accessibilityLabel: "Moves \(moves)"
-            )
-
-            statCard(
-                title: "Pairs",
-                value: "\(matchedPairs)/\(numberOfPairs)",
-                icon: "star.fill",
-                color: selectedTheme.primaryColor,
-                accessibilityLabel: "\(matchedPairs) of \(numberOfPairs) pairs matched"
-            )
-
-            statCard(
-                title: "Time",
-                value: formattedElapsedTime,
-                icon: "clock.fill",
-                color: selectedTheme.primaryColor,
-                accessibilityLabel: timerAccessibilityLabel
-            )
-
-            statCard(
-                title: "Best",
-                value: currentBestMoves == 0 ? "—" : "\(currentBestMoves)",
-                icon: "trophy.fill",
-                color: selectedTheme.accentColor,
-                accessibilityLabel: currentBestMoves == 0
-                    ? "No best score yet"
-                    : "Best score \(currentBestMoves) moves"
-            )
-        }
-    }
-
-    private func statCard(
-        title: String,
-        value: String,
-        icon: String,
-        color: Color,
-        accessibilityLabel: String
-    ) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 18, weight: .bold))
-                .foregroundStyle(color)
-                .frame(width: 38, height: 38)
-                .background(color.opacity(0.13), in: Circle())
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title.uppercased())
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .foregroundStyle(.secondary)
-
-                Text(value)
-                    .font(.system(size: 22, weight: .heavy, design: .rounded))
-                    .foregroundStyle(Color(red: 0.22, green: 0.20, blue: 0.17))
-                    .contentTransition(.numericText())
-            }
-
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 14)
-        .frame(maxWidth: .infinity, minHeight: 74)
-        .background(color.opacity(0.11), in: RoundedRectangle(cornerRadius: 20))
-        .overlay {
-            RoundedRectangle(cornerRadius: 20)
-                .stroke(.white.opacity(0.75), lineWidth: 1)
-        }
-        .shadow(color: color.opacity(0.10), radius: 8, y: 4)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityLabel)
-    }
-
-    private var boardView: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            HStack {
-                Label("Match the pairs", systemImage: selectedTheme.cardBackSymbol)
-                    .font(.system(.headline, design: .rounded, weight: .bold))
-                    .foregroundStyle(selectedTheme.primaryColor)
-
-                Spacer()
-
-                Text("\(cards.count) cards")
-                    .font(.system(.caption, design: .rounded, weight: .semibold))
-                    .foregroundStyle(.secondary)
-            }
-
-            LazyVGrid(columns: columns, spacing: 10) {
-                ForEach(cards) { card in
-                    if card.isMatched {
-                        Color.clear
-                            .aspectRatio(2 / 3, contentMode: .fit)
-                            .accessibilityHidden(true)
-                    } else {
-                        Button {
-                            selectCard(card.id)
-                        } label: {
-                            cardView(for: card)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(isResolvingTurn || card.isFaceUp)
-                        .accessibilityLabel(
-                            card.isFaceUp
-                                ? "Card showing \(card.content)"
-                                : "Face-down memory card"
-                        )
-                        .transition(
-                            .asymmetric(
-                                insertion: .opacity,
-                                removal: .scale(scale: 0.82).combined(with: .opacity)
-                            )
-                        )
-                    }
-                }
-            }
-            .animation(.spring(response: 0.36, dampingFraction: 0.72), value: matchedPairs)
-        }
-        .padding(12)
-        .background(.white.opacity(0.52), in: RoundedRectangle(cornerRadius: 24))
-        .overlay {
-            RoundedRectangle(cornerRadius: 24)
-                .stroke(.white.opacity(0.75), lineWidth: 1)
-        }
-        .shadow(color: selectedTheme.primaryColor.opacity(0.09), radius: 14, y: 7)
-    }
-
-    private var completionView: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "party.popper.fill")
-                .font(.system(size: 30, weight: .bold))
-                .foregroundStyle(selectedTheme.accentColor)
-                .frame(width: 58, height: 58)
-                .background(selectedTheme.accentColor.opacity(0.14), in: Circle())
-
-            Text("You matched them all!")
-                .font(.system(.title2, design: .rounded, weight: .heavy))
-                .foregroundStyle(selectedTheme.primaryColor)
-                .accessibilityAddTraits(.isHeader)
-
-            Text("\(moves) moves  •  \(formattedElapsedTime)")
-                .font(.system(.subheadline, design: .rounded, weight: .semibold))
-                .foregroundStyle(.secondary)
-
-            if achievedNewBest {
-                Label("New Best!", systemImage: "trophy.fill")
-                    .font(.system(.headline, design: .rounded, weight: .bold))
-                    .foregroundStyle(Color(red: 0.46, green: 0.31, blue: 0.04))
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(selectedTheme.accentColor.opacity(0.30), in: Capsule())
-                    .transition(.scale(scale: 0.7).combined(with: .opacity))
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 22)
-        .padding(.horizontal, 18)
-        .background(.white.opacity(0.88), in: RoundedRectangle(cornerRadius: 26))
-        .overlay {
-            RoundedRectangle(cornerRadius: 26)
-                .stroke(selectedTheme.accentColor.opacity(0.35), lineWidth: 1.5)
-        }
-        .shadow(color: selectedTheme.accentColor.opacity(0.18), radius: 14, y: 7)
-        .accessibilityElement(children: .combine)
-    }
-
-    private var resetButton: some View {
+    private var startGameButton: some View {
         Button {
-            requestNewGame()
+            HapticFeedback.newGame()
+            startNewGame()
         } label: {
-            Label("Reset Game", systemImage: "arrow.clockwise")
+            Label("Start Game", systemImage: "play.fill")
                 .font(.system(.headline, design: .rounded, weight: .bold))
                 .foregroundStyle(.white)
                 .frame(maxWidth: .infinity)
@@ -431,7 +337,331 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .shadow(color: selectedTheme.primaryColor.opacity(0.26), radius: 10, y: 6)
-        .accessibilityLabel("Start a new shuffled game")
+        .accessibilityLabel("Start memory game")
+    }
+
+    private var setupBoard: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            boardHeader
+
+            LazyVGrid(columns: setupColumns, spacing: 10) {
+                ForEach(cards) { card in
+                    cardButton(for: card)
+                        .aspectRatio(cardAspectRatio, contentMode: .fit)
+                }
+            }
+        }
+        .padding(12)
+        .background(.white.opacity(0.52), in: RoundedRectangle(cornerRadius: 24))
+        .overlay {
+            RoundedRectangle(cornerRadius: 24)
+                .stroke(.white.opacity(0.75), lineWidth: 1)
+        }
+        .shadow(color: selectedTheme.primaryColor.opacity(0.09), radius: 14, y: 7)
+    }
+
+    private func activeGameContent(screenSize: CGSize) -> some View {
+        let boardHeight = activeBoardHeight(for: screenSize.height)
+
+        return VStack(spacing: 12) {
+            compactHeader
+            compactStats
+            activeBoard(height: boardHeight)
+
+            if phase == .completed {
+                completionView
+                    .transition(.scale(scale: 0.88).combined(with: .opacity))
+            }
+
+            activeActions
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 24)
+        .animation(.spring(response: 0.48, dampingFraction: 0.78), value: phase)
+    }
+
+    private var compactHeader: some View {
+        HStack {
+            themedTitle(size: 31)
+
+            Spacer(minLength: 8)
+
+            if phase == .preview {
+                Label("Memorize", systemImage: "eye.fill")
+                    .font(.system(.caption, design: .rounded, weight: .bold))
+                    .foregroundStyle(selectedTheme.primaryColor)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(selectedTheme.primaryColor.opacity(0.12), in: Capsule())
+            }
+        }
+    }
+
+    private func themedTitle(size: CGFloat) -> some View {
+        Text(selectedTheme.displayTitle)
+            .font(.system(size: size, weight: .heavy, design: .rounded))
+            .foregroundStyle(
+                LinearGradient(
+                    colors: [selectedTheme.secondaryColor, selectedTheme.primaryColor],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            )
+            .lineLimit(1)
+            .minimumScaleFactor(0.70)
+    }
+
+    private var compactStats: some View {
+        HStack(spacing: 7) {
+            compactStatCard(
+                title: "Moves",
+                value: "\(moves)",
+                icon: "hand.tap.fill",
+                color: selectedTheme.secondaryColor,
+                accessibilityLabel: "Moves \(moves)"
+            )
+            compactStatCard(
+                title: "Pairs",
+                value: "\(matchedPairs)/\(numberOfPairs)",
+                icon: "star.fill",
+                color: selectedTheme.primaryColor,
+                accessibilityLabel: "\(matchedPairs) of \(numberOfPairs) pairs matched"
+            )
+            compactStatCard(
+                title: "Time",
+                value: formattedElapsedTime,
+                icon: "clock.fill",
+                color: selectedTheme.primaryColor,
+                accessibilityLabel: timerAccessibilityLabel
+            )
+            compactStatCard(
+                title: "Best",
+                value: currentBestMoves == 0 ? "—" : "\(currentBestMoves)",
+                icon: "trophy.fill",
+                color: selectedTheme.accentColor,
+                accessibilityLabel: currentBestMoves == 0
+                    ? "No best score yet"
+                    : "Best score \(currentBestMoves) moves"
+            )
+        }
+    }
+
+    private func compactStatCard(
+        title: String,
+        value: String,
+        icon: String,
+        color: Color,
+        accessibilityLabel: String
+    ) -> some View {
+        VStack(spacing: 2) {
+            HStack(spacing: 3) {
+                Image(systemName: icon)
+                    .font(.system(size: 9, weight: .bold))
+                Text(title.uppercased())
+                    .font(.system(size: 8, weight: .bold, design: .rounded))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(color)
+
+            Text(value)
+                .font(.system(size: 17, weight: .heavy, design: .rounded))
+                .foregroundStyle(Color(red: 0.22, green: 0.20, blue: 0.17))
+                .contentTransition(.numericText())
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, minHeight: 57)
+        .background(color.opacity(0.11), in: RoundedRectangle(cornerRadius: 15))
+        .overlay {
+            RoundedRectangle(cornerRadius: 15)
+                .stroke(.white.opacity(0.72), lineWidth: 1)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private func activeBoardHeight(for screenHeight: CGFloat) -> CGFloat {
+        if phase == .completed {
+            return min(max(210, screenHeight * 0.27), 260)
+        }
+
+        return min(max(390, screenHeight - 220), 540)
+    }
+
+    private func activeBoard(height: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            boardHeader
+
+            GeometryReader { board in
+                let metrics = cardGridMetrics(in: board.size)
+
+                LazyVGrid(columns: metrics.columns, spacing: metrics.spacing) {
+                    ForEach(cards) { card in
+                        cardButton(for: card)
+                            .frame(width: metrics.cardWidth, height: metrics.cardHeight)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                .animation(.spring(response: 0.36, dampingFraction: 0.72), value: matchedPairs)
+            }
+        }
+        .padding(10)
+        .frame(height: height)
+        .background(.white.opacity(0.52), in: RoundedRectangle(cornerRadius: 22))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22)
+                .stroke(.white.opacity(0.75), lineWidth: 1)
+        }
+        .shadow(color: selectedTheme.primaryColor.opacity(0.09), radius: 12, y: 6)
+        .accessibilityHint(phase == .preview ? "Previewing cards" : "")
+    }
+
+    private var boardHeader: some View {
+        HStack {
+            Label(
+                phase == .preview ? "Previewing cards" : "Match the pairs",
+                systemImage: phase == .preview ? "eye.fill" : selectedTheme.cardBackSymbol
+            )
+            .font(.system(.subheadline, design: .rounded, weight: .bold))
+            .foregroundStyle(selectedTheme.primaryColor)
+
+            Spacer()
+
+            Text("\(cards.count) cards")
+                .font(.system(.caption2, design: .rounded, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func cardGridMetrics(in size: CGSize) -> CardGridMetrics {
+        let rows = max(1, Int(ceil(Double(cards.count) / Double(columnCount))))
+        let spacing: CGFloat = numberOfPairs >= 6 ? 8 : 10
+        let totalHorizontalSpacing = CGFloat(columnCount - 1) * spacing
+        let totalVerticalSpacing = CGFloat(rows - 1) * spacing
+        let widthConstraint = max(1, (size.width - totalHorizontalSpacing) / CGFloat(columnCount))
+        let heightConstraint = max(1, (size.height - totalVerticalSpacing) / CGFloat(rows))
+        let widthFromHeight = heightConstraint * cardAspectRatio
+        let cardWidth = min(widthConstraint, widthFromHeight)
+        let cardHeight = cardWidth / cardAspectRatio
+        let columns = Array(
+            repeating: GridItem(.fixed(cardWidth), spacing: spacing),
+            count: columnCount
+        )
+
+        return CardGridMetrics(
+            columns: columns,
+            cardWidth: cardWidth,
+            cardHeight: cardHeight,
+            spacing: spacing
+        )
+    }
+
+    @ViewBuilder
+    private func cardButton(for card: MemoryCard) -> some View {
+        if card.isMatched {
+            Color.clear
+                .accessibilityHidden(true)
+        } else {
+            Button {
+                selectCard(card.id)
+            } label: {
+                cardView(for: card)
+            }
+            .buttonStyle(.plain)
+            .disabled(phase != .playing || isResolvingTurn || card.isFaceUp)
+            .accessibilityLabel(
+                card.isFaceUp
+                    ? "Card showing \(card.content)"
+                    : "Face-down memory card"
+            )
+            .transition(
+                .asymmetric(
+                    insertion: .opacity,
+                    removal: .scale(scale: 0.82).combined(with: .opacity)
+                )
+            )
+        }
+    }
+
+    private var completionView: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "party.popper.fill")
+                .font(.system(size: 26, weight: .bold))
+                .foregroundStyle(selectedTheme.accentColor)
+
+            Text("You matched them all!")
+                .font(.system(.title3, design: .rounded, weight: .heavy))
+                .foregroundStyle(selectedTheme.primaryColor)
+                .accessibilityAddTraits(.isHeader)
+
+            Text("\(moves) moves  •  \(formattedElapsedTime)")
+                .font(.system(.subheadline, design: .rounded, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            if achievedNewBest {
+                Label("New Best!", systemImage: "trophy.fill")
+                    .font(.system(.headline, design: .rounded, weight: .bold))
+                    .foregroundStyle(Color(red: 0.46, green: 0.31, blue: 0.04))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(selectedTheme.accentColor.opacity(0.30), in: Capsule())
+                    .transition(.scale(scale: 0.7).combined(with: .opacity))
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 17)
+        .background(.white.opacity(0.88), in: RoundedRectangle(cornerRadius: 23))
+        .overlay {
+            RoundedRectangle(cornerRadius: 23)
+                .stroke(selectedTheme.accentColor.opacity(0.35), lineWidth: 1.5)
+        }
+        .shadow(color: selectedTheme.accentColor.opacity(0.18), radius: 12, y: 6)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var activeActions: some View {
+        HStack(spacing: 10) {
+            Button {
+                requestChangeSetup()
+            } label: {
+                Label("Change Setup", systemImage: "slider.horizontal.3")
+                    .font(.system(.subheadline, design: .rounded, weight: .bold))
+                    .foregroundStyle(selectedTheme.primaryColor)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 13)
+                    .background(.white.opacity(0.82), in: RoundedRectangle(cornerRadius: 17))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 17)
+                            .stroke(selectedTheme.primaryColor.opacity(0.25), lineWidth: 1)
+                    }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Change game settings")
+
+            Button {
+                requestNewGame()
+            } label: {
+                Label(
+                    phase == .completed ? "Play Again" : "Reset Game",
+                    systemImage: "arrow.clockwise"
+                )
+                .font(.system(.subheadline, design: .rounded, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 13)
+                .background(
+                    LinearGradient(
+                        colors: [selectedTheme.primaryColor, selectedTheme.cardBackTopColor],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    ),
+                    in: RoundedRectangle(cornerRadius: 17)
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Start a new shuffled game")
+        }
     }
 
     private func cardView(for card: MemoryCard) -> some View {
@@ -452,13 +682,12 @@ struct ContentView: View {
                     perspective: 0.55
                 )
         }
-        .aspectRatio(2 / 3, contentMode: .fit)
         .animation(.easeInOut(duration: 0.32), value: card.isFaceUp)
     }
 
     private var cardBack: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 15)
+            RoundedRectangle(cornerRadius: 14)
                 .fill(
                     LinearGradient(
                         colors: [selectedTheme.cardBackTopColor, selectedTheme.cardBackBottomColor],
@@ -469,43 +698,43 @@ struct ContentView: View {
 
             Circle()
                 .fill(.white.opacity(0.08))
-                .frame(width: 68, height: 68)
-                .offset(x: -30, y: -42)
+                .frame(width: 62, height: 62)
+                .offset(x: -28, y: -38)
 
             Circle()
-                .stroke(.white.opacity(0.12), lineWidth: 8)
-                .frame(width: 82, height: 82)
-                .offset(x: 34, y: 46)
+                .stroke(.white.opacity(0.12), lineWidth: 7)
+                .frame(width: 74, height: 74)
+                .offset(x: 30, y: 40)
 
             Image(systemName: selectedTheme.cardBackSymbol)
-                .font(.system(size: 27, weight: .bold))
+                .font(.system(size: 25, weight: .bold))
                 .foregroundStyle(.white.opacity(0.92))
                 .shadow(color: .black.opacity(0.12), radius: 2, y: 1)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 15))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay {
-            RoundedRectangle(cornerRadius: 15)
+            RoundedRectangle(cornerRadius: 14)
                 .stroke(.white.opacity(0.42), lineWidth: 1.5)
         }
-        .shadow(color: selectedTheme.primaryColor.opacity(0.22), radius: 6, y: 4)
+        .shadow(color: selectedTheme.primaryColor.opacity(0.20), radius: 5, y: 3)
     }
 
     private func cardFront(for card: MemoryCard) -> some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 15)
+            RoundedRectangle(cornerRadius: 14)
                 .fill(Color(red: 1.0, green: 0.985, blue: 0.93))
 
             Circle()
                 .fill(selectedTheme.accentColor.opacity(0.12))
-                .padding(9)
+                .padding(7)
 
             Text(card.content)
                 .font(.system(size: cardSymbolSize))
-                .minimumScaleFactor(0.72)
+                .minimumScaleFactor(0.68)
                 .shadow(color: .black.opacity(0.08), radius: 2, y: 2)
         }
         .overlay {
-            RoundedRectangle(cornerRadius: 15)
+            RoundedRectangle(cornerRadius: 14)
                 .stroke(
                     isResolvingTurn
                         ? Color(red: 0.88, green: 0.30, blue: 0.25)
@@ -516,14 +745,15 @@ struct ContentView: View {
         .shadow(
             color: isResolvingTurn
                 ? Color(red: 0.88, green: 0.30, blue: 0.25).opacity(0.20)
-                : selectedTheme.primaryColor.opacity(0.14),
-            radius: isResolvingTurn ? 7 : 5,
-            y: 3
+                : selectedTheme.primaryColor.opacity(0.13),
+            radius: isResolvingTurn ? 6 : 4,
+            y: 2
         )
     }
 
     private func selectCard(_ cardID: UUID) {
-        guard !isResolvingTurn,
+        guard phase == .playing,
+              !isResolvingTurn,
               let selectedIndex = cards.firstIndex(where: { $0.id == cardID }),
               !cards[selectedIndex].isMatched,
               !cards[selectedIndex].isFaceUp,
@@ -602,7 +832,7 @@ struct ContentView: View {
     }
 
     private func requestNewGame() {
-        if hasMeaningfulProgress {
+        if phase == .playing && hasMeaningfulProgress {
             isShowingNewGameConfirmation = true
         } else {
             HapticFeedback.newGame()
@@ -610,11 +840,25 @@ struct ContentView: View {
         }
     }
 
+    private func requestChangeSetup() {
+        if phase == .playing && hasMeaningfulProgress {
+            isShowingSetupConfirmation = true
+        } else {
+            enterSetupMode()
+        }
+    }
+
     private func startNewGame() {
-        resolutionTask?.cancel()
-        resolutionTask = nil
-        timerTask?.cancel()
-        timerTask = nil
+        let newGameID = prepareBoard(for: .preview)
+        beginPreview(for: newGameID)
+    }
+
+    @discardableResult
+    private func prepareBoard(for newPhase: GamePhase) -> UUID {
+        cancelAsyncTasks()
+
+        let newGameID = UUID()
+        gameID = newGameID
         cards = Self.makeCards(numberOfPairs: numberOfPairs, theme: selectedTheme)
         firstSelectedCardID = nil
         isResolvingTurn = false
@@ -623,6 +867,79 @@ struct ContentView: View {
         hasGameStarted = false
         achievedNewBest = false
         isShowingNewGameConfirmation = false
+        isShowingSetupConfirmation = false
+        phase = newPhase
+        return newGameID
+    }
+
+    private func beginPreview(for previewGameID: UUID) {
+        previewTask = Task {
+            do {
+                try await Task.sleep(for: .milliseconds(300))
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled,
+                  gameID == previewGameID,
+                  phase == .preview else {
+                return
+            }
+
+            withAnimation(.easeInOut(duration: 0.32)) {
+                setUnmatchedCardsFaceUp(true)
+            }
+
+            do {
+                try await Task.sleep(for: .milliseconds(1_820))
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled,
+                  gameID == previewGameID,
+                  phase == .preview else {
+                return
+            }
+
+            withAnimation(.easeInOut(duration: 0.32)) {
+                setUnmatchedCardsFaceUp(false)
+            }
+
+            do {
+                try await Task.sleep(for: .milliseconds(320))
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled,
+                  gameID == previewGameID,
+                  phase == .preview else {
+                return
+            }
+
+            previewTask = nil
+            phase = .playing
+        }
+    }
+
+    private func setUnmatchedCardsFaceUp(_ isFaceUp: Bool) {
+        for index in cards.indices where !cards[index].isMatched {
+            cards[index].isFaceUp = isFaceUp
+        }
+    }
+
+    private func enterSetupMode() {
+        prepareBoard(for: .setup)
+    }
+
+    private func cancelAsyncTasks() {
+        resolutionTask?.cancel()
+        resolutionTask = nil
+        previewTask?.cancel()
+        previewTask = nil
+        timerTask?.cancel()
+        timerTask = nil
     }
 
     private func finishGame() {
@@ -636,6 +953,7 @@ struct ContentView: View {
             achievedNewBest = false
         }
 
+        phase = .completed
         HapticFeedback.win()
     }
 
