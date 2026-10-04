@@ -1,19 +1,34 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     private static let pairCountOptions = [2, 4, 6, 8]
     private static let defaultNumberOfPairs = 4
-    private static let symbols = ["🍎", "🍋", "🍇", "🍉", "🍒", "🥝", "🍓", "🍊"]
 
+    @AppStorage("bestMoves2") private var bestMoves2 = 0
+    @AppStorage("bestMoves4") private var bestMoves4 = 0
+    @AppStorage("bestMoves6") private var bestMoves6 = 0
+    @AppStorage("bestMoves8") private var bestMoves8 = 0
     @State private var cards: [MemoryCard]
     @State private var firstSelectedCardID: UUID?
     @State private var isResolvingTurn = false
     @State private var resolutionTask: Task<Void, Never>?
     @State private var moves = 0
     @State private var numberOfPairs = Self.defaultNumberOfPairs
+    @State private var selectedTheme = GameTheme.fruit
+    @State private var elapsedSeconds = 0
+    @State private var timerTask: Task<Void, Never>?
+    @State private var hasGameStarted = false
+    @State private var achievedNewBest = false
+    @State private var isShowingNewGameConfirmation = false
 
     init() {
-        _cards = State(initialValue: Self.makeCards(numberOfPairs: Self.defaultNumberOfPairs))
+        _cards = State(
+            initialValue: Self.makeCards(
+                numberOfPairs: Self.defaultNumberOfPairs,
+                theme: .fruit
+            )
+        )
     }
 
     private var columns: [GridItem] {
@@ -37,6 +52,30 @@ struct ContentView: View {
         !cards.isEmpty && matchedPairs == numberOfPairs
     }
 
+    private var currentBestMoves: Int {
+        switch numberOfPairs {
+        case 2: bestMoves2
+        case 4: bestMoves4
+        case 6: bestMoves6
+        case 8: bestMoves8
+        default: 0
+        }
+    }
+
+    private var formattedElapsedTime: String {
+        String(format: "%d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)
+    }
+
+    private var timerAccessibilityLabel: String {
+        let minutes = elapsedSeconds / 60
+        let seconds = elapsedSeconds % 60
+        return "Elapsed time \(minutes) minutes \(seconds) seconds"
+    }
+
+    private var hasMeaningfulProgress: Bool {
+        moves > 0 || firstSelectedCardID != nil || matchedPairs > 0 || hasGameStarted
+    }
+
     var body: some View {
         VStack(spacing: 16) {
             Text("Memory Game")
@@ -54,12 +93,42 @@ struct ContentView: View {
                 startNewGame()
             }
 
-            HStack {
-                Text("Moves: \(moves)")
+            Picker("Theme", selection: $selectedTheme) {
+                ForEach(GameTheme.allCases) { theme in
+                    Text(theme.displayName)
+                        .tag(theme)
+                }
+            }
+            .pickerStyle(.menu)
+            .accessibilityLabel("Card theme")
+            .onChange(of: selectedTheme) {
+                startNewGame()
+            }
 
-                Spacer()
+            VStack(spacing: 8) {
+                HStack {
+                    Text("Moves: \(moves)")
+                        .accessibilityLabel("Moves \(moves)")
 
-                Text("Pairs: \(matchedPairs)/\(numberOfPairs)")
+                    Spacer()
+
+                    Text("Pairs: \(matchedPairs)/\(numberOfPairs)")
+                        .accessibilityLabel("\(matchedPairs) of \(numberOfPairs) pairs matched")
+                }
+
+                HStack {
+                    Text("Time: \(formattedElapsedTime)")
+                        .accessibilityLabel(timerAccessibilityLabel)
+
+                    Spacer()
+
+                    Text(currentBestMoves == 0 ? "Best: —" : "Best: \(currentBestMoves) moves")
+                        .accessibilityLabel(
+                            currentBestMoves == 0
+                                ? "No best score yet"
+                                : "Best score \(currentBestMoves) moves"
+                        )
+                }
             }
             .font(.headline)
 
@@ -89,23 +158,49 @@ struct ContentView: View {
                     }
 
                     if gameIsComplete {
-                        Text("You matched them all!")
-                            .font(.title2.bold())
-                            .foregroundStyle(.green)
-                            .accessibilityAddTraits(.isHeader)
+                        VStack(spacing: 6) {
+                            Text("You matched them all!")
+                                .font(.title2.bold())
+                                .accessibilityAddTraits(.isHeader)
+
+                            Text("\(moves) moves in \(formattedElapsedTime)")
+
+                            if achievedNewBest {
+                                Text("New Best!")
+                                    .font(.headline.bold())
+                            }
+                        }
+                        .foregroundStyle(.green)
+                        .accessibilityElement(children: .combine)
                     }
 
                     Button("New Game") {
-                        startNewGame()
+                        requestNewGame()
                     }
                     .buttonStyle(.borderedProminent)
                     .font(.headline)
+                    .accessibilityLabel("Start a new shuffled game")
                 }
             }
         }
         .padding()
         .onDisappear {
             resolutionTask?.cancel()
+            timerTask?.cancel()
+        }
+        .confirmationDialog(
+            "Start a new game?",
+            isPresented: $isShowingNewGameConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("New Game", role: .destructive) {
+                HapticFeedback.newGame()
+                startNewGame()
+            }
+
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Your current progress will be lost.")
         }
     }
 
@@ -134,6 +229,8 @@ struct ContentView: View {
             return
         }
 
+        startTimerIfNeeded()
+        HapticFeedback.cardFlip()
         cards[selectedIndex].isFaceUp = true
 
         guard let firstCardID = firstSelectedCardID,
@@ -150,8 +247,34 @@ struct ContentView: View {
             cards[selectedIndex].isMatched = true
             firstSelectedCardID = nil
             isResolvingTurn = false
+
+            if gameIsComplete {
+                finishGame()
+            } else {
+                HapticFeedback.match()
+            }
         } else {
+            HapticFeedback.mismatch()
             resolveMismatch(firstCardID: firstCardID, secondCardID: cardID)
+        }
+    }
+
+    private func startTimerIfNeeded() {
+        guard !hasGameStarted else { return }
+
+        hasGameStarted = true
+        timerTask?.cancel()
+        timerTask = Task {
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(1))
+                } catch {
+                    return
+                }
+
+                guard !Task.isCancelled else { return }
+                elapsedSeconds += 1
+            }
         }
     }
 
@@ -176,22 +299,83 @@ struct ContentView: View {
         }
     }
 
+    private func requestNewGame() {
+        if hasMeaningfulProgress {
+            isShowingNewGameConfirmation = true
+        } else {
+            HapticFeedback.newGame()
+            startNewGame()
+        }
+    }
+
     private func startNewGame() {
         resolutionTask?.cancel()
         resolutionTask = nil
-        cards = Self.makeCards(numberOfPairs: numberOfPairs)
+        timerTask?.cancel()
+        timerTask = nil
+        cards = Self.makeCards(numberOfPairs: numberOfPairs, theme: selectedTheme)
         firstSelectedCardID = nil
         isResolvingTurn = false
         moves = 0
+        elapsedSeconds = 0
+        hasGameStarted = false
+        achievedNewBest = false
+        isShowingNewGameConfirmation = false
     }
 
-    private static func makeCards(numberOfPairs: Int) -> [MemoryCard] {
-        symbols.shuffled()
+    private func finishGame() {
+        timerTask?.cancel()
+        timerTask = nil
+
+        if currentBestMoves == 0 || moves < currentBestMoves {
+            setCurrentBestMoves(moves)
+            achievedNewBest = true
+        } else {
+            achievedNewBest = false
+        }
+
+        HapticFeedback.win()
+    }
+
+    private func setCurrentBestMoves(_ score: Int) {
+        switch numberOfPairs {
+        case 2: bestMoves2 = score
+        case 4: bestMoves4 = score
+        case 6: bestMoves6 = score
+        case 8: bestMoves8 = score
+        default: break
+        }
+    }
+
+    private static func makeCards(numberOfPairs: Int, theme: GameTheme) -> [MemoryCard] {
+        theme.symbols.shuffled()
             .prefix(numberOfPairs)
             .flatMap { symbol in
                 [MemoryCard(content: symbol), MemoryCard(content: symbol)]
             }
             .shuffled()
+    }
+}
+
+private enum HapticFeedback {
+    static func cardFlip() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    static func match() {
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+    }
+
+    static func mismatch() {
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+    }
+
+    static func win() {
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+    }
+
+    static func newGame() {
+        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
     }
 }
 
