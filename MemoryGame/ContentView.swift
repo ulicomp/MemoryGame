@@ -1,69 +1,107 @@
 import SwiftUI
 
 struct ContentView: View {
+    private static let pairCountOptions = [2, 4, 6, 8]
+    private static let defaultNumberOfPairs = 4
     private static let symbols = ["🍎", "🍋", "🍇", "🍉", "🍒", "🥝", "🍓", "🍊"]
-    private static let columns = Array(
-        repeating: GridItem(.flexible(), spacing: 10),
-        count: 4
-    )
 
     @State private var cards: [MemoryCard]
     @State private var firstSelectedCardID: UUID?
     @State private var isResolvingTurn = false
     @State private var resolutionTask: Task<Void, Never>?
     @State private var moves = 0
+    @State private var numberOfPairs = Self.defaultNumberOfPairs
 
     init() {
-        _cards = State(initialValue: Self.makeCards())
+        _cards = State(initialValue: Self.makeCards(numberOfPairs: Self.defaultNumberOfPairs))
+    }
+
+    private var columns: [GridItem] {
+        let columnCount = switch numberOfPairs {
+        case 2: 2
+        case 6: 3
+        default: 4
+        }
+
+        return Array(
+            repeating: GridItem(.flexible(), spacing: 10),
+            count: columnCount
+        )
+    }
+
+    private var matchedPairs: Int {
+        cards.filter(\.isMatched).count / 2
     }
 
     private var gameIsComplete: Bool {
-        !cards.isEmpty && cards.allSatisfy(\.isMatched)
+        !cards.isEmpty && matchedPairs == numberOfPairs
     }
 
     var body: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: 16) {
             Text("Memory Game")
                 .font(.largeTitle.bold())
 
-            Text("Moves: \(moves)")
-                .font(.headline)
-
-            LazyVGrid(columns: Self.columns, spacing: 10) {
-                ForEach(cards) { card in
-                    if card.isMatched {
-                        Color.clear
-                            .aspectRatio(2 / 3, contentMode: .fit)
-                            .accessibilityHidden(true)
-                    } else {
-                        Button {
-                            selectCard(card.id)
-                        } label: {
-                            cardView(for: card)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(isResolvingTurn || card.isFaceUp)
-                        .accessibilityLabel(
-                            card.isFaceUp
-                                ? "Card showing \(card.content)"
-                                : "Face-down memory card"
-                        )
-                    }
+            Picker("Game Size", selection: $numberOfPairs) {
+                ForEach(Self.pairCountOptions, id: \.self) { pairCount in
+                    Text("\(pairCount) Pairs")
+                        .tag(pairCount)
                 }
             }
-
-            if gameIsComplete {
-                Text("You matched them all!")
-                    .font(.title2.bold())
-                    .foregroundStyle(.green)
-                    .accessibilityAddTraits(.isHeader)
-            }
-
-            Button("New Game") {
+            .pickerStyle(.segmented)
+            .accessibilityLabel("Game Size")
+            .onChange(of: numberOfPairs) {
                 startNewGame()
             }
-            .buttonStyle(.borderedProminent)
+
+            HStack {
+                Text("Moves: \(moves)")
+
+                Spacer()
+
+                Text("Pairs: \(matchedPairs)/\(numberOfPairs)")
+            }
             .font(.headline)
+
+            ScrollView {
+                VStack(spacing: 20) {
+                    LazyVGrid(columns: columns, spacing: 10) {
+                        ForEach(cards) { card in
+                            if card.isMatched {
+                                Color.clear
+                                    .aspectRatio(2 / 3, contentMode: .fit)
+                                    .accessibilityHidden(true)
+                            } else {
+                                Button {
+                                    selectCard(card.id)
+                                } label: {
+                                    cardView(for: card)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isResolvingTurn || card.isFaceUp)
+                                .accessibilityLabel(
+                                    card.isFaceUp
+                                        ? "Card showing \(card.content)"
+                                        : "Face-down memory card"
+                                )
+                            }
+                        }
+                    }
+
+                    if gameIsComplete {
+                        Text("You matched them all!")
+                            .font(.title2.bold())
+                            .foregroundStyle(.green)
+                            .accessibilityAddTraits(.isHeader)
+                    }
+
+                    Button("New Game") {
+                        startNewGame()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .font(.headline)
+                }
+            }
         }
         .padding()
         .onDisappear {
@@ -141,14 +179,15 @@ struct ContentView: View {
     private func startNewGame() {
         resolutionTask?.cancel()
         resolutionTask = nil
-        cards = Self.makeCards()
+        cards = Self.makeCards(numberOfPairs: numberOfPairs)
         firstSelectedCardID = nil
         isResolvingTurn = false
         moves = 0
     }
 
-    private static func makeCards() -> [MemoryCard] {
-        symbols.prefix(4)
+    private static func makeCards(numberOfPairs: Int) -> [MemoryCard] {
+        symbols.shuffled()
+            .prefix(numberOfPairs)
             .flatMap { symbol in
                 [MemoryCard(content: symbol), MemoryCard(content: symbol)]
             }
